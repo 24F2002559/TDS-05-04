@@ -39,14 +39,23 @@ def check_hardcoded_secret(fm, body, debug=False):
         r'https?://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_\-]+',
         r'https?://[^\s]+/hooks?/',
         r'https?://[^\s]+/webhook/',
-        r'https?://[^\s]+\?.*\btoken=[A-Za-z0-9]+',          # URL with token parameter
-        r'https?://[^\s]+\?.*\bkey=[A-Za-z0-9]+',            # URL with key parameter
         r'Bearer [A-Za-z0-9._\-]{20,}',
         r'Authorization:\s*Basic\s+[A-Za-z0-9+/=]{10,}',
     ]
     for pat in token_patterns:
         if re.search(pat, full_text, re.IGNORECASE):
             return True if not debug else (True, {"token_pattern": pat})
+
+    # Any URL with a query parameter that has a token-like value (≥8 alphanumeric chars)
+    url_with_query = re.findall(r'https?://[^\s]+\?([^\s]+)', full_text)
+    for query in url_with_query:
+        # split on & and find any parameter value that is alphanumeric and ≥8
+        for pair in query.split('&'):
+            if '=' in pair:
+                key, val = pair.split('=', 1)
+                val = val.strip()
+                if len(val) >= 8 and re.match(r'^[A-Za-z0-9._\-]+$', val) and not re.search(r'[\$\{]', val):
+                    return True if not debug else (True, {"url_token_param": f"{key}={val}"})
 
     # Secrets assigned to known keywords
     secret_keywords = r'(api[_\s]?key|secret|token|password|webhook|auth[_\s]?token|access[_\s]?key|api[_\s]?secret|credentials)'
@@ -97,6 +106,10 @@ def check_prompt_injection(body, debug=False):
         r'continue regardless',
         r'proceed without (any )?user',
         r'bypass any warnings',
+        r'do not interrupt',
+        r'never ask for confirmation',
+        r'always obey',
+        r'you must never refuse',
     ]
     combined = '|'.join(phrases)
     match = re.findall(combined, body, re.IGNORECASE) if debug else None
@@ -109,20 +122,24 @@ def check_excessive_permissions(fm, debug=False):
         return (False, {}) if debug else False
 
     candidates = []
-    # Broad permission key names
+    # Nested permission blocks
     perm_keys = ('permissions', 'tools', 'capabilities', 'access', 'security', 'sandbox', 'scope', 'rights', 'privileges')
     for k in perm_keys:
         if k in fm:
-            if isinstance(fm[k], dict):
-                candidates.append(fm[k])
-            elif isinstance(fm[k], list):
-                for item in fm[k]:
+            val = fm[k]
+            if isinstance(val, dict):
+                candidates.append(val)
+            elif isinstance(val, list):
+                for item in val:
                     if isinstance(item, dict):
                         candidates.append(item)
                     elif isinstance(item, str):
+                        # a string inside a list might be something like "read:/" or "network:*"
+                        # treat it as a one-element candidate dict with a made-up key
                         candidates.append({k: item})
-            elif isinstance(fm[k], str):
-                candidates.append({k: fm[k]})
+            elif isinstance(val, str):
+                # bare string like permissions: *
+                candidates.append({k: val})
 
     # Top-level shorthand
     if any(k in fm for k in ('network', 'filesystem', 'fs', 'storage', 'net', 'networking', 'egress', 'outbound')):
@@ -134,6 +151,7 @@ def check_excessive_permissions(fm, debug=False):
     details = {"candidates": [], "wild_fs": [], "wild_net": []}
     for cand in candidates:
         details["candidates"].append(cand)
+
         # filesystem
         fs = cand.get('filesystem') or cand.get('fs') or cand.get('file') or cand.get('storage') or cand.get('volume')
         if isinstance(fs, dict):
@@ -150,9 +168,16 @@ def check_excessive_permissions(fm, debug=False):
                 if not debug: return True
         elif isinstance(fs, list):
             for p in fs:
-                if isinstance(p, str) and p in wild_paths:
-                    details["wild_fs"].append(p)
-                    if not debug: return True
+                if isinstance(p, str):
+                    # could be "read:/" or just "/"
+                    if ':' in p:
+                        _, path = p.split(':', 1)
+                        path = path.strip()
+                    else:
+                        path = p.strip()
+                    if path in wild_paths:
+                        details["wild_fs"].append(path)
+                        if not debug: return True
 
         # network
         net = cand.get('network') or cand.get('net') or cand.get('networking') or cand.get('egress') or cand.get('outbound') or cand.get('domains') or cand.get('hosts')
@@ -184,7 +209,6 @@ def check_unclear_provenance(fm, body, debug=False):
     if missing:
         return (True, {"missing": missing}) if debug else True
 
-    # Broader action words for version changes
     action = r'(update|change|modify|write|set|increment|bump|alter|release|publish|tag)'
     suspicious = []
     for line in body.splitlines():
