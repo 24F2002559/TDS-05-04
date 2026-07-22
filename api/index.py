@@ -1,12 +1,9 @@
-import re
-import yaml
+import re, yaml
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ---------- Helper: extract YAML frontmatter and body ----------
 def parse_skill(skill_text):
-    """Return (frontmatter_dict, body_markdown) from a skill file."""
     lines = skill_text.splitlines()
     if not lines or lines[0].strip() != '---':
         return None, skill_text
@@ -25,72 +22,48 @@ def parse_skill(skill_text):
 
 # ---------- Checkers ----------
 def check_hardcoded_secret(fm, body, debug=False):
-    """Flag if the file contains a likely hardcoded secret or webhook URL.
-       If debug=True, returns (bool, dict with details)."""
-    details = {}
     full_text = body
     if fm:
-        for val in fm.values():
-            if isinstance(val, str):
-                full_text += '\n' + val
+        for v in fm.values():
+            if isinstance(v, str):
+                full_text += '\n' + v
 
-    # Known secret patterns
-    secret_patterns = {
-        'openai_key': r'sk-[a-zA-Z0-9]{32,}',
-        'github_token': r'ghp_[a-zA-Z0-9]{36,}',
-        'slack_token': r'xox[baprs]-[0-9a-zA-Z-]+',
-        'aws_access_key': r'AKIA[0-9A-Z]{16}',
-        'jwt': r'eyJ[a-zA-Z0-9._-]+',
-        'slack_webhook': r'https?://hooks\.slack\.com/services/[A-Za-z0-9/_]+',
-        'discord_webhook': r'https?://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_\-]+',
-        'generic_webhook': r'https?://[^/\s]*/hooks?/',
-        'bearer_token': r'Bearer [A-Za-z0-9._\-]{20,}',
-        'basic_auth': r'Authorization:\s*Basic\s+[A-Za-z0-9+/=]{10,}',
-    }
-    matched_patterns = []
-    for name, pat in secret_patterns.items():
+    # Broad secret patterns
+    patterns = [
+        r'sk-[a-zA-Z0-9]{32,}',                     # OpenAI / generic
+        r'ghp_[a-zA-Z0-9]{36,}',                    # GitHub
+        r'xox[baprs]-[0-9a-zA-Z-]+',                # Slack
+        r'AKIA[0-9A-Z]{16}',                        # AWS access key
+        r'eyJ[a-zA-Z0-9._-]+',                      # JWT
+        r'https?://hooks\.slack\.com/services/[A-Za-z0-9/_]+',
+        r'https?://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_\-]+',
+        r'https?://[^\s/]+/hooks?/',                # generic webhook
+        r'Bearer [A-Za-z0-9._\-]{20,}',
+        r'Authorization:\s*Basic\s+[A-Za-z0-9+/=]{10,}',
+        r'secret\s*[:=]\s*["\']?[A-Za-z0-9_\-+/=]{12,}',  # secret: value
+        r'token\s*[:=]\s*["\']?[A-Za-z0-9_\-+/=]{12,}',
+    ]
+    for pat in patterns:
         if re.search(pat, full_text, re.IGNORECASE):
-            matched_patterns.append(name)
-            if not debug: return True   # early exit for normal scan
+            return True if not debug else (True, {"pattern": pat})
 
-    # Assignment detection
-    secret_keys = r'(?:api[_\s]?key|secret|token|password|webhook|auth[_\s]?token|access[_\s]?key|api[_\s]?secret|credentials)'
-    # Pattern 1: quoted values
-    assignment_re = secret_keys + r'\s*[:=]\s*["\']([^"\']+)["\']'
-    assignment_matches = re.findall(assignment_re, full_text, re.IGNORECASE)
-    detailed_assignments = []
-    for val in assignment_matches:
-        if not re.search(r'[\$]', val) and '${' not in val and 'os.environ' not in val:
-            detailed_assignments.append(('quoted', val))
-            if not debug: return True
+    # Secret-like assignments (key = value)
+    secret_keywords = r'(api[_\s]?key|secret|token|password|webhook|auth[_\s]?token|access[_\s]?key|api[_\s]?secret|credentials)'
+    # quoted values
+    for m in re.finditer(secret_keywords + r'\s*[:=]\s*["\']([^"\']{6,})["\']', full_text, re.IGNORECASE):
+        val = m.group(2)
+        if not re.search(r'[\$\{]', val):   # not an env var
+            return True if not debug else (True, {"assignment": val})
+    # unquoted values that look like secrets
+    for m in re.finditer(secret_keywords + r'\s*[:=]\s*(\S+)\s*', full_text, re.IGNORECASE):
+        val = m.group(2)
+        if len(val) >= 12 and re.search(r'[a-zA-Z]', val) and re.search(r'[0-9]', val) and not re.search(r'[\$\{]', val):
+            return True if not debug else (True, {"unquoted": val})
 
-    # Pattern 2: unquoted values that look secret-like
-    yaml_assignment_re = secret_keys + r'\s*:\s*(\S+)\s*'
-    yaml_matches = re.findall(yaml_assignment_re, full_text, re.IGNORECASE)
-    for val in yaml_matches:
-        if not re.search(r'[\$]', val) and '${' not in val and 'os.environ' not in val:
-            if len(val) >= 8 and re.search(r'[a-zA-Z]', val) and re.search(r'[0-9]', val):
-                detailed_assignments.append(('unquoted', val))
-                if not debug: return True
-
-    # 3. Random-looking long strings in frontmatter values
-    random_fm_vals = []
-    if fm:
-        for key, val in fm.items():
-            if isinstance(val, str) and len(val) >= 20 and re.match(r'^[A-Za-z0-9._\-+/=]+$', val):
-                if not re.search(r'[\s]', val) and not re.search(r'[a-z]', val[:4]) and re.search(r'[a-zA-Z]', val) and re.search(r'[0-9]', val):
-                    random_fm_vals.append((key, val))
-                    if not debug: return True
-
-    if debug:
-        details['matched_patterns'] = matched_patterns
-        details['assignment_matches'] = detailed_assignments
-        details['random_fm_vals'] = random_fm_vals
-        return bool(matched_patterns or detailed_assignments or random_fm_vals), details
-    return False
+    return (False, {}) if debug else False
 
 def check_prompt_injection(body, debug=False):
-    suspicious_phrases = [
+    phrases = [
         r'ignore (all |previous )?instructions?',
         r'disregard (the )?(user|above|previous)',
         r'do not ask (for |the user )?(confirmation|permission)',
@@ -114,148 +87,123 @@ def check_prompt_injection(body, debug=False):
         r'keep this secret',
         r'do not tell the user',
     ]
-    combined = '|'.join(suspicious_phrases)
-    matches = re.findall(combined, body, re.IGNORECASE) if debug else None
-    flagged = bool(re.search(combined, body, re.IGNORECASE))
-    if debug:
-        return flagged, {'matches': matches}
-    return flagged
+    combined = '|'.join(phrases)
+    match = re.findall(combined, body, re.IGNORECASE) if debug else None
+    if re.search(combined, body, re.IGNORECASE):
+        return (True, {"matches": match}) if debug else True
+    return (False, {}) if debug else False
 
 def check_excessive_permissions(fm, debug=False):
     if not fm:
-        return False
+        return (False, {}) if debug else False
 
-    permission_candidates = []
-    for key in ('permissions', 'tools', 'capabilities', 'access', 'security', 'sandbox'):
-        if key in fm and isinstance(fm[key], dict):
-            permission_candidates.append(fm[key])
+    # collect all possible permission subtrees
+    candidates = []
+    for k in ('permissions', 'tools', 'capabilities', 'access', 'security', 'sandbox'):
+        if k in fm and isinstance(fm[k], dict):
+            candidates.append(fm[k])
+    if any(k in fm for k in ('network', 'filesystem', 'fs', 'storage')):
+        candidates.append(fm)
 
-    if 'network' in fm or 'filesystem' in fm or 'fs' in fm:
-        permission_candidates.append(fm)
+    details = {"candidates": candidates, "wild_fs": [], "wild_net": []}
 
-    details = {'permission_candidates': permission_candidates, 'broad_fs': [], 'broad_net': []}
-    for perm in permission_candidates:
-        # Filesystem checks
-        fs = perm.get('filesystem') or perm.get('fs') or perm.get('file') or perm.get('storage') or perm.get('volume')
+    wild_paths = {'/', '/home', '~', '~/', '/root', '*', '**', 'all', 'any', 'world'}
+    wild_nets = {'*', '0.0.0.0/0', 'any', 'all', 'world', 'internet'}
+
+    for cand in candidates:
+        # filesystem
+        fs = cand.get('filesystem') or cand.get('fs') or cand.get('file') or cand.get('storage') or cand.get('volume')
         if isinstance(fs, dict):
-            all_paths = []
-            for mode in ('read', 'write', 'rw'):
-                paths = fs.get(mode, [])
-                if isinstance(paths, str):
-                    all_paths.append(paths)
-                elif isinstance(paths, list):
-                    all_paths.extend(paths)
-            for val in fs.values():
-                if isinstance(val, str):
-                    all_paths.append(val)
-            for p in all_paths:
-                if p in ('/', '/home', '~', '~/', '/root', '*', '**', 'all', 'any', 'world'):
-                    details['broad_fs'].append(p)
-                    if not debug: return True
+            for mode in ('read', 'write', 'rw', 'allow', 'deny'):
+                val = fs.get(mode, [])
+                if isinstance(val, str): val = [val]
+                for p in val:
+                    if isinstance(p, str) and p in wild_paths:
+                        details["wild_fs"].append(p)
+                        if not debug: return True
+        elif isinstance(fs, str) and fs in wild_paths:
+            details["wild_fs"].append(fs)
+            if not debug: return True
 
-        # Network checks
-        net = perm.get('network') or perm.get('net') or perm.get('networking') or perm.get('egress') or perm.get('outbound') or perm.get('domains') or perm.get('hosts')
+        # network
+        net = cand.get('network') or cand.get('net') or cand.get('networking') or cand.get('egress') or cand.get('outbound') or cand.get('domains') or cand.get('hosts')
         if isinstance(net, str):
-            if net in ('*', '0.0.0.0/0', 'any', 'all', 'world', 'internet'):
-                details['broad_net'].append(net)
+            if net in wild_nets:
+                details["wild_net"].append(net)
                 if not debug: return True
         elif isinstance(net, dict):
-            for subval in net.values():
-                if isinstance(subval, str) and subval in ('*', '0.0.0.0/0', 'any', 'all', 'world', 'internet'):
-                    details['broad_net'].append(subval)
-                    if not debug: return True
-                elif isinstance(subval, list):
-                    for entry in subval:
-                        if entry in ('*', '0.0.0.0/0', 'any', 'all', 'world', 'internet'):
-                            details['broad_net'].append(entry)
-                            if not debug: return True
+            for v in net.values():
+                vals = [v] if isinstance(v, str) else (v if isinstance(v, list) else [])
+                for entry in vals:
+                    if entry in wild_nets:
+                        details["wild_net"].append(entry)
+                        if not debug: return True
         elif isinstance(net, list):
             for entry in net:
-                if entry in ('*', '0.0.0.0/0', 'any', 'all', 'world', 'internet'):
-                    details['broad_net'].append(entry)
+                if entry in wild_nets:
+                    details["wild_net"].append(entry)
                     if not debug: return True
 
-    flagged = bool(details['broad_fs'] or details['broad_net'])
-    if debug:
-        return flagged, details
-    return flagged
+    if details["wild_fs"] or details["wild_net"]:
+        return (True, details) if debug else True
+    return (False, details) if debug else False
 
 def check_unclear_provenance(fm, body, debug=False):
     if not fm:
-        return True
-    missing = []
-    for field in ('author', 'version', 'changelog'):
-        if field not in fm or not fm[field]:
-            missing.append(field)
+        return (True, {"reason": "no frontmatter"}) if debug else True
+    missing = [f for f in ('author', 'version', 'changelog') if not fm.get(f)]
     if missing:
-        if debug:
-            return True, {'missing_fields': missing}
-        return True
+        return (True, {"missing": missing}) if debug else True
 
-    # Detect steps that modify version without mentioning changelog
-    action_words = r'(?:update|change|modify|write|set|increment|bump|alter)'
-    suspicious_lines = []
+    # stealth version changes
+    action = r'(update|change|modify|write|set|increment|bump|alter)'
+    suspicious = []
     for line in body.splitlines():
-        if re.search(r'version', line, re.IGNORECASE):
-            if re.search(action_words, line, re.IGNORECASE):
-                if 'changelog' not in line.lower():
-                    suspicious_lines.append(line.strip())
-                    if not debug: return True
+        if re.search(r'version', line, re.IGNORECASE) and re.search(action, line, re.IGNORECASE):
+            if 'changelog' not in line.lower():
+                suspicious.append(line.strip())
+                if not debug: return True
     if debug:
-        return bool(suspicious_lines), {'suspicious_lines': suspicious_lines}
-    return bool(suspicious_lines)
+        return (bool(suspicious), {"suspicious_lines": suspicious})
+    return bool(suspicious)
 
-# ---------- Grader endpoint ----------
+# ---------- Main endpoint ----------
 @app.route('/', methods=['POST'])
 def scan():
     data = request.get_json()
     skill_text = data.get('skill', '')
     fm, body = parse_skill(skill_text)
-    categories = []
-
+    cats = []
     if check_hardcoded_secret(fm, body):
-        categories.append('hardcoded_secret')
+        cats.append('hardcoded_secret')
     if check_prompt_injection(body):
-        categories.append('prompt_injection')
+        cats.append('prompt_injection')
     if check_excessive_permissions(fm):
-        categories.append('excessive_permissions')
+        cats.append('excessive_permissions')
     if check_unclear_provenance(fm, body):
-        categories.append('unclear_provenance')
+        cats.append('unclear_provenance')
+    return jsonify({"categories": cats})
 
-    return jsonify({"categories": categories})
-
-# ---------- Debug endpoint (not used by grader) ----------
+# ---------- Debug endpoint ----------
 @app.route('/debug', methods=['POST'])
 def debug_scan():
     data = request.get_json()
     skill_text = data.get('skill', '')
     fm, body = parse_skill(skill_text)
 
-    hard_secret, secret_details = check_hardcoded_secret(fm, body, debug=True)
-    prompt_inj, prompt_details = check_prompt_injection(body, debug=True)
-    excessive, excess_details = check_excessive_permissions(fm, debug=True)
-    unclear_prov, prov_details = check_unclear_provenance(fm, body, debug=True)
+    sec, sec_d = check_hardcoded_secret(fm, body, debug=True)
+    prm, prm_d = check_prompt_injection(body, debug=True)
+    exc, exc_d = check_excessive_permissions(fm, debug=True)
+    prv, prv_d = check_unclear_provenance(fm, body, debug=True)
 
     return jsonify({
         "frontmatter": fm,
-        "body_preview": body[:500],   # first 500 chars
+        "body_preview": body[:500],
         "checks": {
-            "hardcoded_secret": {
-                "flagged": hard_secret,
-                "details": secret_details
-            },
-            "prompt_injection": {
-                "flagged": prompt_inj,
-                "details": prompt_details
-            },
-            "excessive_permissions": {
-                "flagged": excessive,
-                "details": excess_details
-            },
-            "unclear_provenance": {
-                "flagged": unclear_prov,
-                "details": prov_details
-            }
+            "hardcoded_secret": {"flagged": sec, "details": sec_d},
+            "prompt_injection": {"flagged": prm, "details": prm_d},
+            "excessive_permissions": {"flagged": exc, "details": exc_d},
+            "unclear_provenance": {"flagged": prv, "details": prv_d}
         }
     })
 
