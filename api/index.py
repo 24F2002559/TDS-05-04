@@ -37,8 +37,10 @@ def check_hardcoded_secret(fm, body, debug=False):
         r'eyJ[a-zA-Z0-9._-]+',
         r'https?://hooks\.slack\.com/services/[A-Za-z0-9/_]+',
         r'https?://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_\-]+',
-        r'https?://[^\s]+/hooks?/',                # generic webhook path
-        r'https?://[^\s]+/webhook/',               # alternative
+        r'https?://[^\s]+/hooks?/',
+        r'https?://[^\s]+/webhook/',
+        r'https?://[^\s]+\?.*\btoken=[A-Za-z0-9]+',          # URL with token parameter
+        r'https?://[^\s]+\?.*\bkey=[A-Za-z0-9]+',            # URL with key parameter
         r'Bearer [A-Za-z0-9._\-]{20,}',
         r'Authorization:\s*Basic\s+[A-Za-z0-9+/=]{10,}',
     ]
@@ -46,7 +48,7 @@ def check_hardcoded_secret(fm, body, debug=False):
         if re.search(pat, full_text, re.IGNORECASE):
             return True if not debug else (True, {"token_pattern": pat})
 
-    # Secrets assigned to known keywords (key = value)
+    # Secrets assigned to known keywords
     secret_keywords = r'(api[_\s]?key|secret|token|password|webhook|auth[_\s]?token|access[_\s]?key|api[_\s]?secret|credentials)'
     safe_values = {'none', 'null', 'example', 'your-secret-here', 'placeholder', 'changeme', ''}
 
@@ -56,7 +58,7 @@ def check_hardcoded_secret(fm, body, debug=False):
         if val.lower() not in safe_values and not re.search(r'[\$\{]', val):
             return True if not debug else (True, {"quoted_assignment": val})
 
-    # Unquoted values – allow any non‑env, non‑safe word
+    # Unquoted values
     for m in re.finditer(secret_keywords + r'\s*[:=]\s*(\S+)', full_text, re.IGNORECASE):
         val = m.group(2).strip()
         if val.lower() not in safe_values and not re.search(r'[\$\{]', val) and len(val) >= 3:
@@ -91,6 +93,10 @@ def check_prompt_injection(body, debug=False):
         r'don\'t listen to',
         r'ignore user input',
         r'pretend you are',
+        r'do not stop until',
+        r'continue regardless',
+        r'proceed without (any )?user',
+        r'bypass any warnings',
     ]
     combined = '|'.join(phrases)
     match = re.findall(combined, body, re.IGNORECASE) if debug else None
@@ -103,21 +109,23 @@ def check_excessive_permissions(fm, debug=False):
         return (False, {}) if debug else False
 
     candidates = []
-    # Nested permission blocks
-    for k in ('permissions', 'tools', 'capabilities', 'access', 'security', 'sandbox'):
-        if k in fm and isinstance(fm[k], dict):
-            candidates.append(fm[k])
-        elif k in fm and isinstance(fm[k], list):
-            # list of strings or dicts
-            for item in fm[k]:
-                if isinstance(item, dict):
-                    candidates.append(item)
-                elif isinstance(item, str):
-                    # treat the whole list as a candidate with that string as a filesystem/net value
-                    candidates.append({k: item})
+    # Broad permission key names
+    perm_keys = ('permissions', 'tools', 'capabilities', 'access', 'security', 'sandbox', 'scope', 'rights', 'privileges')
+    for k in perm_keys:
+        if k in fm:
+            if isinstance(fm[k], dict):
+                candidates.append(fm[k])
+            elif isinstance(fm[k], list):
+                for item in fm[k]:
+                    if isinstance(item, dict):
+                        candidates.append(item)
+                    elif isinstance(item, str):
+                        candidates.append({k: item})
+            elif isinstance(fm[k], str):
+                candidates.append({k: fm[k]})
 
     # Top-level shorthand
-    if any(k in fm for k in ('network', 'filesystem', 'fs', 'storage')):
+    if any(k in fm for k in ('network', 'filesystem', 'fs', 'storage', 'net', 'networking', 'egress', 'outbound')):
         candidates.append(fm)
 
     wild_paths = {'/', '/home', '~', '~/', '/root', '*', '**', 'all', 'any', 'world'}
@@ -176,7 +184,8 @@ def check_unclear_provenance(fm, body, debug=False):
     if missing:
         return (True, {"missing": missing}) if debug else True
 
-    action = r'(update|change|modify|write|set|increment|bump|alter)'
+    # Broader action words for version changes
+    action = r'(update|change|modify|write|set|increment|bump|alter|release|publish|tag)'
     suspicious = []
     for line in body.splitlines():
         if re.search(r'version', line, re.IGNORECASE) and re.search(action, line, re.IGNORECASE):
